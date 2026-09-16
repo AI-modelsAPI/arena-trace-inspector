@@ -1,0 +1,12 @@
+{
+  "manifest_version": 3,
+  "name": "Arena Trace Inspector",
+  "version": "1.0.0",
+  "description": "读取当前 Arena 测试会话的运行 trace，显示服务端模型标签。",
+  "minimum_chrome_version": "118",
+  "permissions": ["activeTab", "debugger", "storage"],
+  "host_permissions": ["https://arena.ai/*", "https://api.trigger.dev/*"],
+  "background": {"service_worker": "background.js", "type": "module"},
+  "action": {"default_popup": "popup.html", "default_title": "Arena Trace Inspector"},
+  "content_scripts": [{"matches": ["https://arena.ai/*"], "js": ["view-model.js", "panel.js", "hud-layout.js", "conversation-rename.js", "auto-draw.js", "hud.js"], "run_at": "document_idle"}]
+}
