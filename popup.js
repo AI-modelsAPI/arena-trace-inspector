@@ -28,7 +28,10 @@ function render(s) {
   $('listen-dot').classList.toggle('on',!!s.enabled);renderPanel();
 }
 button.addEventListener('click',async()=>{button.disabled=true;try{render(await chrome.runtime.sendMessage({type:'ATI_TOGGLE',tabId}));}catch{status.textContent='操作失败，请重新打开扩展';}finally{button.disabled=false;}});
-chrome.runtime.onMessage.addListener(msg=>{if(msg.type==='ATI_STATE'&&msg.tabId===tabId)render(msg.state);});
+chrome.runtime.onMessage.addListener(msg=>{
+  if(msg.type==='ATI_STATE'&&msg.tabId===tabId)render(msg.state);
+  if(msg.type==='ATI_PULSE'&&msg.pulse){lastPulse=msg.pulse;pulseErr='';renderPulse();}
+});
 $('run-select').addEventListener('change',e=>{selectedRunId=e.target.value;renderPanel();});
 $('back-current').addEventListener('click',()=>{selectedUrl='';selectedRunId='';renderPanel();});
 async function deleteRecord(record) {
@@ -83,4 +86,25 @@ try{
   if(!tab?.url||new URL(tab.url).origin!=='https://arena.ai'){render({...state,status:'切换到 Arena 标签页即可开启监听；也可查看下方历史记录。'});}
   else{render(await chrome.runtime.sendMessage({type:'ATI_STATUS',tabId}));button.disabled=false;}
 }catch{status.textContent='无法读取标签页，请重新打开扩展';renderPanel();}
+let lastPulse=null,pulseErr='';
+function renderPulse(){
+  const el=$('pulse'),bar=$('pulse-bar'),fill=$('pulse-fill');
+  if(lastPulse){
+    el.hidden=false;el.textContent=ArenaPulse.format(lastPulse)+(pulseErr?' · '+pulseErr:'');
+    el.title='额度接口每 60 秒读取一次'+(lastPulse.resetAt?'；重置时间 '+new Date(lastPulse.resetAt).toLocaleString():'');
+    const r=ArenaPulse.remaining(lastPulse);
+    if(r===null||r===undefined){bar.hidden=true;}
+    else{bar.hidden=false;fill.style.width=Math.max(0,Math.min(100,r))+'%';const lv=ArenaPulse.level(lastPulse);fill.className='pulse-fill'+(lv==='warn'?' warn':lv==='crit'?' crit':'');}
+  }else if(pulseErr){el.hidden=false;el.textContent='额度读取失败';el.title=pulseErr;bar.hidden=true;}
+}
+async function loadPulse(){
+  try{
+    const r=await chrome.runtime.sendMessage({type:'ATI_PULSE_GET'});
+    if(r?.pulse){lastPulse=r.pulse;pulseErr='';}
+    else if(r?.error)pulseErr=r.error;
+  }catch{/* popup closing mid-request is harmless */}
+  renderPulse();
+}
+void loadPulse();
+setInterval(renderPulse,1000); // live reset countdown while the popup is open
 await loadHistory();

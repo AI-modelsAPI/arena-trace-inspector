@@ -22,7 +22,7 @@ globalThis.fetch = async(url,options) => {
   calls.push({url,options});
   if(fetchMode==='deferred') await new Promise(resolve=>{release=resolve;});
   return {
-    ok:fetchMode!=='401',status:fetchMode==='401'?401:200,
+    ok:fetchMode!=='401'&&fetchMode!=='404',status:fetchMode==='401'?401:fetchMode==='404'?404:200,
     text:async()=>JSON.stringify({events:[{runId:'run_test',message:'ai.streamText.doStream',spanId:'testspan',style:{icon:'ai-provider-xai',accessory:{items:[{text:'example-model',icon:'tabler-cube'}]}}}]})
   };
 };
@@ -31,7 +31,7 @@ const popup={id:'test-extension',url:'chrome-extension://test-extension/popup.ht
 const message=(type,tabId,sender=popup)=>new Promise(resolve=>hooks.message({type,tabId},sender,resolve));
 const tick=()=>new Promise(resolve=>setImmediate(resolve));
 const token=(session='test-session')=>'header.'+Buffer.from(JSON.stringify({pub:true,iss:'https://id.trigger.dev',aud:'https://api.trigger.dev',exp:9999999999,scopes:['read:runs:run_test','read:sessions:'+session]})).toString('base64url')+'.sig';
-const sse=(session='test-session')=>'event: batch\ndata: '+JSON.stringify({records:[{headers:[['public-access-token',token(session)]]}]})+'\n\n';
+const sse=(session='test-session', tok=token(session))=>'event: batch\ndata: '+JSON.stringify({records:[{headers:[['public-access-token',tok]]}]})+'\n\n';
 const response=tabId=>hooks.network({tabId},'Network.responseReceived',{requestId:'request1',response:{status:200,url:'https://arena.ai/ai-proxy/realtime/v1/sessions/test-session/out'}});
 
 test('background: buffered SSE -> fixed GET -> sanitized state -> stop',async()=>{
@@ -77,6 +77,20 @@ test('background: mismatched token never triggers fetch',async()=>{
   assert.match((await message('ATI_STATUS',2)).status,/不匹配/);
   await message('ATI_TOGGLE',2);
 });
+test('background: 404 schedules a retry instead of failing the capture',async()=>{
+  buffered=Buffer.from(sse()).toString('base64'); fetchMode='404';
+  await message('ATI_TOGGLE',8); response(8); await tick(); await tick();
+  const state=await message('ATI_STATUS',8);
+  assert.deepEqual(state.models,[]); assert.match(state.status,/重试/);
+  await message('ATI_TOGGLE',8); fetchMode='ok';
+});
+test('background: run-claim tokens without session scopes still query trace',async()=>{
+  const modern='header.'+Buffer.from(JSON.stringify({pub:true,iss:'https://id.trigger.dev',aud:'https://api.trigger.dev',exp:9999999999,run:'run_test'})).toString('base64url')+'.sig';
+  buffered=Buffer.from(sse('test-session', modern)).toString('base64');
+  await message('ATI_TOGGLE',7); response(7); await tick(); await tick();
+  assert.equal((await message('ATI_STATUS',7)).models[0].model,'example-model');
+  await message('ATI_TOGGLE',7);
+});
 test('background: 401 stops without model guessing',async()=>{
   buffered=Buffer.from(sse()).toString('base64'); fetchMode='401';
   await message('ATI_TOGGLE',3); response(3); await tick(); await tick();
@@ -100,6 +114,14 @@ test('background: live data chunks and off-origin navigation cleanup',async()=>{
   assert.equal((await message('ATI_STATUS',5)).enabled,false);
 });
 
+test('background: page-snoop token triggers the same trace lookup',async()=>{
+  await message('ATI_TOGGLE',11);
+  const sender={id:'test-extension',url:'https://arena.ai/agent',frameId:0,tab:{id:11}};
+  await new Promise(resolve=>hooks.message({type:'ATI_PAGE_TOKEN',token:token('test-session'),sessionId:'test-session',pageUrl:'https://arena.ai/agent/test-session'},sender,resolve));
+  await tick(); await tick();
+  assert.equal((await message('ATI_STATUS',11)).models[0].model,'example-model');
+  await message('ATI_TOGGLE',11);
+});
 test('HUD controls only sender tab; enable is idempotent and never sends Agent messages',async()=>{
  const sender={id:'test-extension',url:'https://arena.ai/agent',frameId:0,tab:{id:41}};
  const control=enabled=>new Promise(resolve=>hooks.message({type:'ATI_SET_LISTENING',tabId:42,enabled},sender,resolve));

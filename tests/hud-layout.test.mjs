@@ -4,9 +4,10 @@ import '../hud-layout.js';
 import {createHudPreferences,HUD_PREF_KEY} from '../hud-preferences.js';
 const L=globalThis.ArenaHudLayout;
 test('HUD defaults and whitelist reject invalid positions and extra sensitive fields',()=>{
- assert.deepEqual(L.defaults(),{schemaVersion:1,collapsed:false,position:{x:1,y:1}});
+ assert.deepEqual(L.defaults(),{schemaVersion:1,collapsed:false,position:{x:1,y:1},probeTargets:'opus5, fable5, gpt6',findAll:true});
  const p=L.sanitize({collapsed:true,position:{x:-5,y:9,token:'SECRET'},token:'SECRET'});
- assert.deepEqual(p,{schemaVersion:1,collapsed:true,position:{x:0,y:1}});assert.ok(!JSON.stringify(p).includes('SECRET'));
+ assert.deepEqual(p,{schemaVersion:1,collapsed:true,position:{x:0,y:1},probeTargets:'opus5, fable5, gpt6',findAll:true});assert.ok(!JSON.stringify(p).includes('SECRET'));
+ assert.equal(L.sanitize({findAll:false}).findAll,false);
  assert.deepEqual(L.sanitize({position:{x:NaN,y:Infinity}}).position,{x:1,y:1});
 });
 test('dragging is clamped on all viewport edges and positions round trip',()=>{

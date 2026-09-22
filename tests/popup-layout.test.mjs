@@ -10,5 +10,5 @@ test('popup intrinsic width is fixed and cannot feed back through viewport-relat
 });
 test('toolbar popup entry and existing permissions remain intact',()=>{
  const m=JSON.parse(fs.readFileSync(new URL('../manifest.json',import.meta.url),'utf8'));
- assert.equal(m.action.default_popup,'popup.html');assert.deepEqual(m.permissions,['activeTab','debugger','storage']);
+ assert.equal(m.action.default_popup,'popup.html');assert.deepEqual(m.permissions,['activeTab','debugger','storage','cookies']);
 });

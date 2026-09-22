@@ -1,14 +1,59 @@
-import {isArena, streamSession, decode64, validateToken, SSEParser, publicTokens, extractModels} from './core.js';
+import {isArena, streamSession, decode64, validateToken, SSEParser, publicTokens, extractModels, isFatalTraceStatus, traceStatusLabel} from './core.js';
 import {createHistoryStore, conversationUrl, createAutoRenameStore} from './history.js';
 import {extractUsage, mergeUsage, summarizeUsage, formatUsage} from './usage.js';
 import {sessionFromUrl, emptyView, historicalView} from './restore.js';
 import {createHudPreferences} from './hud-preferences.js';
+import './pulse.js';
 
 const history = createHistoryStore(chrome.storage.local);
 const autoRename = createAutoRenameStore(chrome.storage.local);
 const storageReady = chrome.storage.local.setAccessLevel({accessLevel: 'TRUSTED_CONTEXTS'}).then(() => true, () => false);
 
 const hudPreferences = createHudPreferences(chrome.storage.local, storageReady);
+// Quota pulse: fetched at most once per minute, shared by every tab and the popup.
+// Concurrent callers share one in-flight request; a 429 blocks further calls until
+// the Retry-After window (default 2 minutes) has passed.
+let pulseCache = {at: 0, result: null};
+let pulseInflight = null, pulseBlockedUntil = 0;
+async function getPulse() {
+  if (pulseCache.result && Date.now() - pulseCache.at < 60000) return pulseCache.result;
+  if (Date.now() < pulseBlockedUntil) throw Error('额度接口限流中，约 ' + Math.max(1, Math.round((pulseBlockedUntil - Date.now()) / 60000)) + ' 分钟后自动恢复');
+  if (pulseInflight) return pulseInflight;
+  pulseInflight = (async () => {
+    try {
+      const res = await fetch(globalThis.ArenaPulse.PULSE_URL, {credentials: 'include', headers: {accept: 'application/json'}});
+      if (res.status === 429) {
+        const retrySec = Number(res.headers?.get?.('retry-after'));
+        const waitMs = Number.isFinite(retrySec) && retrySec > 0 ? Math.min(600000, retrySec * 1000) : 120000;
+        pulseBlockedUntil = Date.now() + waitMs;
+        throw Error('额度接口限流（429），' + Math.max(1, Math.round(waitMs / 60000)) + ' 分钟后自动重试');
+      }
+      if (!res.ok) throw Error('额度接口返回 ' + res.status);
+      const json = await res.json().catch(() => null);
+      const result = {pulse: globalThis.ArenaPulse.parse(json), fetchedAt: new Date().toISOString(), keys: json && typeof json === 'object' && !Array.isArray(json) ? Object.keys(json).slice(0, 12) : []};
+      pulseCache = {at: Date.now(), result};
+      return result;
+    } finally { pulseInflight = null; }
+  })();
+  return pulseInflight;
+}
+function broadcastPulse(result) {
+  chrome.tabs.query({url: 'https://arena.ai/*'}).then(tabs => {
+    for (const t of tabs) if (Number.isInteger(t.id)) chrome.tabs.sendMessage(t.id, {type: 'ATI_PULSE', ...result}).catch(() => {});
+  }).catch(() => {});
+  chrome.runtime.sendMessage({type: 'ATI_PULSE', ...result}).catch(() => {}); // open popup
+}
+// Signing into another account rewrites arena.ai cookies: drop the cached quota
+// immediately and push the fresh value instead of waiting out the 60s cache.
+chrome.cookies?.onChanged?.addListener(({cookie, removed} = {}) => {
+  if (!cookie || !/(^|\.)arena\.ai$/.test(cookie.domain || '')) return;
+  if (Date.now() < pulseBlockedUntil) return;      // already backing off from a 429
+  if (Date.now() - pulseCache.at < 15000) return; // cookie churn bursts: one refetch is enough
+  pulseCache = {at: 0, result: null};
+  getPulse().then(broadcastPulse).catch(() => {});
+});
+// Test-only hook: pulse cache/block state is module-private by design.
+globalThis.__pulseResetForTest = () => { pulseCache = {at: 0, result: null}; pulseInflight = null; pulseBlockedUntil = 0; };
 const sessions = new Map();
 const listenCommands = new Map();
 const archiveTickets = new Map();
@@ -101,14 +146,17 @@ async function start(tabId) {
   if (!isArena(tab.pendingUrl || tab.url)) throw new Error('请在 https://arena.ai 页面开启');
   if (sessions.has(tabId)) return safeState(sessions.get(tabId));
   const pageSession = sessionFromUrl(tab.pendingUrl || tab.url);
-  const s = {streams: new Map(), generation: 0, pageSession, activeSession: pageSession, view: emptyView(pageSession, true)};
-  // Do not detach an existing debugger owned by DevTools or another extension.
-  try { await chrome.debugger.attach({tabId}, '1.3'); }
-  catch { throw new Error('无法附加调试器。请结束 Codex 对此标签页的控制，或关闭该页 DevTools 后重试。'); }
+  const s = {streams: new Map(), generation: 0, pageSession, activeSession: pageSession, view: emptyView(pageSession, true), debugger: false};
+  try {
+    await chrome.debugger.attach({tabId}, '1.3');
+    s.debugger = true;
+  } catch {
+    throw new Error('无法附加调试器。请结束 Codex 对此标签页的控制，或关闭该页 DevTools 后重试。页面流钩子仍会在开启成功后并行截获令牌。');
+  }
   sessions.set(tabId, s);
   try { await command(tabId, 'Network.enable'); }
   catch { await stop(tabId); throw new Error('无法开启 Network 事件捕获'); }
-  update(tabId, s, {});
+  update(tabId, s, {status: '监听中：调试器 + 页面流钩子，发送消息后获取模型名'});
   return restoreForTab(tabId);
 }
 
@@ -139,13 +187,18 @@ async function lookup(tabId, s, token, sessionId) {
       });
       if (!live()) return;
       if (!response.ok) {
-        const labels = {401: '令牌被拒绝或已过期', 403: '该令牌无权读取 trace', 404: '运行 trace 不存在', 429: '接口限流，已停止查询'};
-        throw new Error(labels[response.status] || ('trace 返回 HTTP ' + response.status));
+        const label = traceStatusLabel(response.status);
+        if (isFatalTraceStatus(response.status) || attempt >= 8) throw new Error(label);
+        update(tabId, s, {status: label + '，等待重试 ' + attempt + '/8'});
+        s.timer = setTimeout(poll, 3000);
+        return;
       }
       const text = await response.text();
       if (!live()) return;
       if (text.length > 4 * 1024 * 1024) throw new Error('trace 超过 4 MB，停止解析');
-      const trace = JSON.parse(text);
+      let trace;
+      try { trace = JSON.parse(text); }
+      catch { throw new Error('trace 不是有效 JSON'); }
       const models = extractModels(trace, claims.runId);
       const checkedAt = new Date().toISOString();
       const extracted = extractUsage(trace, claims.runId, checkedAt);
@@ -177,10 +230,16 @@ async function lookup(tabId, s, token, sessionId) {
       update(tabId, s, {status: 'trace 暂无模型标签，等待重试 ' + attempt + '/8'});
       s.timer = setTimeout(poll, 3000);
     } catch (e) {
-      if (live()) {
+      if (!live()) return;
+      const known = /令牌|trace|接口|运行|无权|过期/.test(e.message || '');
+      const fatal = /令牌被拒绝|无权读取|接口限流|超过 4 MB/.test(e.message || '');
+      const message = known ? e.message : 'trace 请求失败或超时，请检查网络和扩展站点权限';
+      if (fatal || attempt >= 8) {
         s.token = null; s.lastToken = null;
-        const known = /令牌|trace|接口|运行|无权/.test(e.message || '');
-        update(tabId, s, {status: known ? e.message : 'trace 请求失败或超时，请检查网络和扩展站点权限'});
+        update(tabId, s, {status: message, fatal});
+      } else {
+        update(tabId, s, {status: message + '，等待重试 ' + attempt + '/8'});
+        s.timer = setTimeout(poll, 3000);
       }
     } finally { clearTimeout(timeout); }
   };
@@ -303,6 +362,11 @@ chrome.runtime.onMessage.addListener((msg, sender, reply) => {
     })().catch(()=>reply({error:'聊天可能已归档，但本地记录未能删除；请在扩展会话列表重试删除记录'}));
     return true;
   }
+  if (msg.type === 'ATI_PULSE_GET') {
+    if (!popup && (sender.frameId !== 0 || !isArena(sender.url))) return;
+    getPulse().then(reply, e => reply({error: e?.message || '额度读取失败，请稍后重试'}));
+    return true;
+  }
   const tabId = popup ? msg.tabId : sender.tab?.id;
   if (!Number.isInteger(tabId) || (!popup && !isArena(sender.url))) return;
   if (msg.type === 'ATI_HUD_GET' || msg.type === 'ATI_HUD_SAVE') {
@@ -342,6 +406,45 @@ chrome.runtime.onMessage.addListener((msg, sender, reply) => {
   }
   if (msg.type === 'ATI_STATUS') {
     restoreForTab(tabId, popup ? null : pageUrl).then(reply, () => reply({enabled: false, ...emptyView(), status: '读取本地记录失败，请重试。'}));
+    return true;
+  }
+  if (msg.type === 'ATI_ACQUIRE') {
+    (async () => {
+      if (popup || sender.frameId !== 0) throw Error('Invalid sender');
+      const tab = await chrome.tabs.get(tabId);
+      const url = tab.pendingUrl || tab.url;
+      if (!isArena(url)) throw Error('Invalid page');
+      const s = sessions.get(tabId), v = s?.view;
+      const want = typeof msg.sessionId === 'string' ? msg.sessionId : sessionFromUrl(url);
+      if (!s) return {ok: false, stage: 'idle', status: '未开启监听'};
+      if (v.fatal) return {ok: false, fatal: true, stage: 'error', status: v.status, sessionId: v.sessionId, runId: v.runId};
+      if (v.historical) return {ok: false, stage: 'stream', status: v.status || '仍是历史记录，等待本次运行'};
+      if (want && v.sessionId && v.sessionId !== want) return {ok: false, stage: 'stream', status: '等待当前会话流…'};
+      if (v.models?.length && (!want || v.sessionId === want)) return {ok: true, stage: 'model', sessionId: v.sessionId, runId: v.runId, models: v.models, status: v.status || '已识别模型'};
+      if (v.runId) return {ok: false, stage: 'trace', sessionId: v.sessionId, runId: v.runId, status: v.status || '正在拉取 trace'};
+      if (s.hasCapture || v.sessionId) return {ok: false, stage: 'token', sessionId: v.sessionId, status: v.status || '已捕获会话流，等待运行令牌…'};
+      return {ok: false, stage: 'stream', status: v.status || '等待会话流（页面钩子 + 调试器）'};
+    })().then(reply, () => reply({ok: false, fatal: true, stage: 'error', status: '无法读取模型获取状态'}));
+    return true;
+  }
+  if (msg.type === 'ATI_PAGE_TOKEN') {
+    (async () => {
+      if (popup || sender.frameId !== 0 || typeof msg.token !== 'string' || typeof msg.sessionId !== 'string') throw Error('Invalid token sender');
+      if (!/^[a-zA-Z0-9-]{1,128}$/.test(msg.sessionId)) throw Error('Invalid session');
+      const tab = await chrome.tabs.get(tabId);
+      if (!isArena(tab.pendingUrl || tab.url)) throw Error('Invalid page');
+      const s = sessions.get(tabId);
+      if (!s) return {ok: false};
+      s.hasCapture = true;
+      invalidateRestore(tabId);
+      if (s.pageSession && s.pageSession !== msg.sessionId && sessionFromUrl(tab.pendingUrl || tab.url) !== msg.sessionId) return {ok: false};
+      if (s.activeSession !== msg.sessionId) {
+        cancelLookup(s); s.activeSession = msg.sessionId; s.resolvedRun = null;
+        update(tabId, s, {status: '页面流已截获令牌，正在拉取 trace…', sessionId: msg.sessionId, historical: false, runId: null, models: [], run: null, usage: null, checkedAt: null, saved: false, usageText: '', totalUsageText: '', fatal: false});
+      }
+      await lookup(tabId, s, msg.token, msg.sessionId);
+      return {ok: true};
+    })().then(reply, () => reply({ok: false}));
     return true;
   }
   const setListening = msg.type === 'ATI_SET_LISTENING';

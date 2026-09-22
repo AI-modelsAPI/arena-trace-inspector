@@ -2,9 +2,14 @@
 (() => {
   const finite = n => typeof n === 'number' && Number.isFinite(n);
   const unit = n => finite(n) ? Math.max(0, Math.min(1, n)) : 1;
-  const defaults = () => ({schemaVersion:1,collapsed:false,position:{x:1,y:1}});
+  const DEFAULT_TARGETS = 'opus5, fable5, gpt6';
+  function sanitizeTargets(text) {
+    const parts = String(typeof text === 'string' ? text : DEFAULT_TARGETS).split(/[,，;；\n]+/).map(s => s.trim().replace(/[.\s]+$/, '')).filter(s => s.length >= 2 && s.length <= 80).slice(0, 20);
+    return parts.length ? parts.join(', ') : DEFAULT_TARGETS;
+  }
+  const defaults = () => ({schemaVersion:1,collapsed:false,position:{x:1,y:1},probeTargets:DEFAULT_TARGETS,findAll:true});
   function sanitize(value) {
-    return {schemaVersion:1,collapsed:value?.collapsed === true,position:{x:unit(value?.position?.x),y:unit(value?.position?.y)}};
+    return {schemaVersion:1,collapsed:value?.collapsed === true,position:{x:unit(value?.position?.x),y:unit(value?.position?.y)},probeTargets:sanitizeTargets(value?.probeTargets),findAll:value?.findAll !== false};
   }
   function bounds(size, viewport) {
     const vw=Math.max(0,viewport.width||0),vh=Math.max(0,viewport.height||0);

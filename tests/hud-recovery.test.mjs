@@ -4,7 +4,7 @@ import {setupHud as setup} from './hud-dom-fixture.mjs';
 const tick=()=>new Promise(r=>setImmediate(r));
 test('HUD retries local startup reads, then stops after success without capture requests',async()=>{
  let attempt=0;const h=setup(()=>++attempt<3?Promise.reject(Error('receiver starting')):Promise.resolve({enabled:false,historical:false,sessionId:'session-a'}));
- await tick();assert.equal(h.timers[0].delay,250);h.timers[0].fn();await tick();assert.equal(h.timers[1].delay,750);h.timers[1].fn();await tick();assert.equal(attempt,3);assert.equal(h.timers.length,2);assert.ok(h.messages.every(m=>['ATI_STATUS','ATI_HUD_GET','ATI_AUTO_RENAME_GET'].includes(m.type)));
+ await tick();assert.equal(h.timers[0].delay,250);h.timers[0].fn();await tick();assert.equal(h.timers[1].delay,750);h.timers[1].fn();await tick();assert.equal(attempt,3);assert.equal(h.timers.length,2);assert.ok(h.messages.every(m=>['ATI_STATUS','ATI_HUD_GET','ATI_AUTO_RENAME_GET','ATI_PULSE_GET'].includes(m.type)));
 });
 test('HUD discards an old failed request after a newer navigation refresh',async()=>{
  let rejectOld,calls=0;const h=setup(()=>++calls===1?new Promise((_,reject)=>{rejectOld=reject;}):Promise.resolve({enabled:false,historical:false,sessionId:'session-a'}));h.events.pageshow();await tick();rejectOld(Error('old receiver'));await tick();assert.equal(h.timers.length,0);assert.equal(calls,2);
@@ -31,4 +31,21 @@ test('same-page collapse survives updates; new path opens expanded without auto-
 test('connection failure exposes retry instead of silently hiding the HUD',async()=>{
  const h=setup(()=>Promise.reject(Error('offline')));await tick();for(let i=0;i<4;i++){h.timers[i].fn();await tick();}
  assert.equal(h.root.querySelector('.listen-button').textContent,'重试连接');assert.ok(h.root.children[0].isConnected);
+});
+test('an invalidated extension context points to a page refresh instead of spinning forever',async()=>{
+ const h=setup(()=>Promise.resolve({enabled:false,sessionId:'session-a'}),false,{status:()=>({running:false,phase:'idle',progress:'ready'}),configure(){},start(){},stop(){}});await tick();
+ const listen=h.root.querySelector('.listen-button'),start=h.root.querySelector('.draw-start'),probe=h.root.querySelector('.draw-probe');
+ assert.equal(listen.textContent,'开启监听');assert.equal(start.disabled,false);
+ h.invalidateContext(); // Extension reloaded: injected script is now orphaned.
+ h.events.pageshow();await tick();
+ assert.equal(listen.textContent,'刷新页面');assert.equal(listen.disabled,false);
+ assert.equal(start.disabled,true,'auto draw must lock when context is lost');
+ assert.equal(probe.disabled,true,'auto probe must lock when context is lost');
+ listen.handlers.click();assert.equal(h.reloads,1,'clicking must reload the page to re-inject');
+});
+test('a synchronous context-loss throw during refresh does not wedge the HUD',async()=>{
+ const h=setup(()=>Promise.resolve({enabled:false,sessionId:'session-a'}),false,{status:()=>({running:false,phase:'idle',progress:'ready'}),configure(){},start(){},stop(){}});await tick();
+ h.invalidateContext();h.events.visibilitychange?.();h.events.pageshow();await tick();
+ assert.equal(h.root.querySelector('.listen-button').textContent,'刷新页面');
+ assert.equal(h.timers.filter(t=>!t.cancelled).length,0,'no retry timer should keep firing after context loss');
 });

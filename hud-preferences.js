@@ -8,7 +8,7 @@ export function createHudPreferences(area,ready=Promise.resolve(true)) {
     save(input){
       const work=queue.then(async()=>{
         const current=await read();
-        const next=ArenaHudLayout.sanitize({collapsed:typeof input?.collapsed==='boolean'?input.collapsed:current.collapsed,position:input?.position||current.position});
+        const next=ArenaHudLayout.sanitize({collapsed:typeof input?.collapsed==='boolean'?input.collapsed:current.collapsed,position:input?.position||current.position,probeTargets:typeof input?.probeTargets==='string'?input.probeTargets:current.probeTargets,findAll:typeof input?.findAll==='boolean'?input.findAll:current.findAll});
         await area.set({[HUD_PREF_KEY]:next});return next;
       });
       queue=work.catch(()=>{});return work;

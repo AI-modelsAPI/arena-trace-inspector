@@ -1,4 +1,9 @@
 import {createEvidence, mergeEvidence} from './evidence.js';
+import {traceEvents} from './core.js';
+const MODEL_SPANS = /^(ai\.(?:streamText\.doStream|generateText\.doGenerate|streamObject\.doStream|generateObject\.doGenerate))$/;
+const CUBE_ICONS = new Set(['tabler-cube', 'cube', 'tabler-box']);
+const spanName = event => String(event?.message || event?.name || event?.spanName || '');
+const isModelSpan = event => MODEL_SPANS.test(spanName(event));
 // Only parse observed trace labels; do not infer provider prices or input/output splits.
 export function parseTokenLabel(label) {
   if (typeof label !== 'string') return null;
@@ -14,13 +19,13 @@ export function parseCostLabel(label) {
 }
 export function extractUsage(trace, runId, checkedAt = new Date().toISOString()) {
   const spans = new Map();
-  for (const event of trace.events || []) {
-    if (event.runId !== runId || event.message !== 'ai.streamText.doStream' || typeof event.spanId !== 'string') continue;
+  for (const event of traceEvents(trace) || []) {
+    if (event.runId !== runId || typeof event.spanId !== 'string' || !isModelSpan(event)) continue;
     const items = event.style?.accessory?.items || [];
     const tokenLabel = items.find(i => i.icon === 'tabler-hash')?.text;
     const costLabel = items.find(i => i.icon === 'tabler-currency-dollar')?.text;
     const tokens = parseTokenLabel(tokenLabel);
-    const model = String(items.find(i => i.icon === 'tabler-cube')?.text || '').slice(0, 200);
+    const model = String(items.find(i => CUBE_ICONS.has(i.icon))?.text || '').slice(0, 200);
     const providerIcon = typeof event.style?.icon === 'string' && /^ai-provider-[\w.-]+$/.test(event.style.icon) ? event.style.icon : null;
     const costUsd = parseCostLabel(costLabel);
     const flag = key => typeof event[key] === 'boolean' ? event[key] : null;
